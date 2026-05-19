@@ -9,13 +9,15 @@
 # index per-prefix worker affinity on a hybrid Mamba/Attention model.
 #
 # Build (from the dynamo repo root, on a node with docker + the local
-# dynamo:latest-vllm-local image already built):
+# dynamo:latest-vllm-runtime image already built via
+# `container/render.py --framework vllm --target runtime --output-short-filename
+#  && docker build -t dynamo:latest-vllm-runtime -f container/rendered.Dockerfile .`):
 #   docker build \
 #     -t nemotron-3-super-turbo:dev \
 #     -f recipes/turbo-recipes/nemotron-3-super/Dockerfile \
 #     recipes/turbo-recipes/nemotron-3-super
 
-ARG BASE_IMAGE="dynamo:latest-vllm-local"
+ARG BASE_IMAGE="dynamo:latest-vllm-runtime"
 
 FROM ${BASE_IMAGE}
 USER root

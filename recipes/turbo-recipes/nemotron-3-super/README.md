@@ -5,27 +5,29 @@ SPDX-License-Identifier: Apache-2.0
 
 # Nemotron-3-Super Turbo NIM
 
-Layers three vLLM source patches onto a locally-built `dynamo:latest-vllm-local`
+Layers three vLLM source patches onto a locally-built `dynamo:latest-vllm-runtime`
 image so the Dynamo KV-aware router actually receives prefix signal when
 serving [nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8)
 (a hybrid Mamba+Attention model).
 
-Patch-level detail and version-skew handling live in
+Patch-level detail and version-skew handling:
 `/home/scratch.vanshils_gpu_1/nemotron-turbo-nim/tmp/patches_for_distribution/`
 (`README.md` + `COMPATIBILITY.md`).
 
 ## Prerequisites
 
-- A node with Docker and an NVIDIA runtime (this recipe was developed against
-  `viking-prod-650`; build/run is done over SSH from the computelab login node).
-- Local image `dynamo:latest-vllm-local` already built — produced by dynamo's
-  `container/build.sh` flow on the same node.
-- `NGC_API_KEY` and `HF_TOKEN` available in the user's shell environment for
-  HF gated download of `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8`.
+- A node with Docker and an NVIDIA runtime.
+- Local image `dynamo:latest-vllm-runtime` already built from this repo:
+  ```bash
+  container/render.py --framework vllm --target runtime --output-short-filename
+  docker build -t dynamo:latest-vllm-runtime -f container/rendered.Dockerfile .
+  ```
+- `NGC_API_KEY` and `HF_TOKEN` set for HF gated download of
+  `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8`.
 
 ## Build
 
-From the dynamo repo root, on the GPU node:
+From the dynamo repo root:
 
 ```bash
 docker build \
@@ -34,58 +36,40 @@ docker build \
   recipes/turbo-recipes/nemotron-3-super
 ```
 
-Or wrap from a login node:
-
-```bash
-ssh viking-prod-650 'cd /home/scratch.vanshils_gpu_1/nemotron-turbo-nim/myfork_dynamo && \
-  docker build -t nemotron-3-super-turbo:dev \
-    -f recipes/turbo-recipes/nemotron-3-super/Dockerfile \
-    recipes/turbo-recipes/nemotron-3-super'
-```
-
 The build-time check
 `assert hasattr(EngineCoreProc, "get_kv_cache_group_metadata")` is the canary
-that all three patches landed cleanly. If it fails, the image will not build.
+that all three patches landed cleanly. Build fails if it doesn't.
 
-## Run the docker container
+## Run
+
+Start the container:
 
 ```bash
-# 1. Launch container detached so docker exec can target it.
-docker run -d --runtime nvidia --gpus all --network host --ipc=host \
-  --name nemotron_diag \
+docker run -it --runtime nvidia --gpus all --network host --ipc=host \
   -v /home/scratch.vanshils_gpu_1/:/my_scratch_space_1/ \
-  -e NGC_API_KEY="${NGC_API_KEY}" \
-  -e HF_TOKEN="${HF_TOKEN}" \
+  -e NGC_API_KEY -e HF_TOKEN \
   -e HF_HOME=/my_scratch_space_1/nemotron-turbo-nim/tmp/hf_cache \
   --entrypoint /bin/bash \
-  nemotron-3-super-turbo:dev -lc 'sleep infinity'
-
-# 2. Start etcd + nats-server inside the container (background).
-docker exec -d nemotron_diag bash -lc \
-  'mkdir -p /tmp/vanshils_nemotron && \
-   etcd --data-dir /tmp/etcd-data --listen-client-urls http://0.0.0.0:2379 \
-        --advertise-client-urls http://0.0.0.0:2379 \
-        >/tmp/vanshils_nemotron/etcd.log 2>&1 &
-   nats-server -js >/tmp/vanshils_nemotron/nats.log 2>&1 &'
-
-# 3. Start the patched vLLM worker.
-docker exec -d nemotron_diag \
-  bash /workspace/recipes/turbo-recipes/nemotron-3-super/launch_worker.sh
-
-# 4. Start the frontend with KV-aware routing.
-docker exec -d nemotron_diag \
-  bash /workspace/recipes/turbo-recipes/nemotron-3-super/launch_frontend.sh
-
-# 5. Tail logs.
-docker exec -it nemotron_diag tail -f /tmp/vanshils_nemotron/worker.log
-docker exec -it nemotron_diag tail -f /tmp/vanshils_nemotron/frontend.log
+  nemotron-3-super-turbo:dev
 ```
 
-Smoke test once the frontend is up:
+Inside the container:
 
 ```bash
-curl http://<gpu-node>:8000/v1/models
-curl http://<gpu-node>:8000/v1/chat/completions \
+mkdir -p /tmp/vanshils_nemotron
+etcd --data-dir /tmp/etcd-data --listen-client-urls http://0.0.0.0:2379 \
+     --advertise-client-urls http://0.0.0.0:2379 &
+nats-server -js &
+
+bash /workspace/recipes/turbo-recipes/nemotron-3-super/launch_worker.sh &
+bash /workspace/recipes/turbo-recipes/nemotron-3-super/launch_frontend.sh &
+```
+
+Smoke test:
+
+```bash
+curl http://localhost:8000/v1/models
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
        "messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
@@ -93,19 +77,8 @@ curl http://<gpu-node>:8000/v1/chat/completions \
 
 ## What the launch scripts do
 
-- **`launch_worker.sh`** — runs
-  `python -m dynamo.vllm --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8
-  --tensor-parallel-size 8 --block-size 64 --trust-remote-code
-  --kv-events-config '{"publisher":"zmq", ..., "endpoint":"tcp://*:20080"}'`.
-  The `--block-size 64` is load-bearing: it's the `hash_block_size` that
-  Patch 02 preserves through the hybrid-model `attn_block_size` inflation
-  (otherwise vLLM bumps `block_size` to 2176 and no `BlockStored` event
-  fires for prompts under that length).
-- **`launch_frontend.sh`** — runs
-  `python -m dynamo.frontend --router-mode kv --router-reset-states
-  --http-port 8000` with
-  `DYN_LOG=info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug` so
-  per-request KV-router scoring lines surface in `frontend.log`.
+- **`launch_worker.sh`** — `python -m dynamo.vllm --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8 --tensor-parallel-size 8 --block-size 64 --trust-remote-code --kv-events-config '{"publisher":"zmq",...,"endpoint":"tcp://*:20080"}'`. `--block-size 64` is the `hash_block_size` Patch 02 preserves through the hybrid `attn_block_size` inflation — without it vLLM bumps to 2176 and no `BlockStored` event fires for prompts under that length.
+- **`launch_frontend.sh`** — `python -m dynamo.frontend --router-mode kv --router-reset-states --http-port 8000` with `DYN_LOG=info,dynamo_kv_router=debug,dynamo_llm::kv_router=debug` so per-request KV-router scoring lines surface in `frontend.log`.
 
 ## File Layout
 
