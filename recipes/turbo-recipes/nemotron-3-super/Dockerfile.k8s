@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.10.0
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# K8s-deployable image for the nemotron-3-super recipe.
+# Bakes the published Dynamo vllm-runtime nightly + ONLY the upstream vLLM
+# PR patch (PR #40984, "feat(kv-events): emit KV cache metadata"). No local
+# WIP patches.
+#
+# Build + push (one-line tag mirrors the base nightly date/sha):
+#   ssh computelab-build-4.nvidia.com
+#   cd /home/scratch.vanshils_gpu_1/nemotron-turbo-nim/myfork_dynamo
+#   TAG=nightly-20260527-dddf8f6-cuda13
+#   docker build \
+#     --build-arg BASE_IMAGE=nvcr.io/nvstaging/ai-dynamo/vllm-runtime:$TAG \
+#     -t nvcr.io/nvstaging/nim/nemotron-3-super-turbo:$TAG \
+#     -f recipes/turbo-recipes/nemotron-3-super/Dockerfile.k8s \
+#     recipes/turbo-recipes/nemotron-3-super
+#   docker push nvcr.io/nvstaging/nim/nemotron-3-super-turbo:$TAG
+
+ARG BASE_IMAGE="nvcr.io/nvstaging/ai-dynamo/vllm-runtime:nightly-20260527-dddf8f6-cuda13"
+
+FROM ${BASE_IMAGE}
+USER root
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends patch \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --chown=root:root patches/01_vllm_pr40984.patch /opt/dynamo/turbo-patches/
+
+RUN set -eux; \
+    VLLM_PARENT="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')"; \
+    cd "${VLLM_PARENT}"; \
+    patch -p1 < /opt/dynamo/turbo-patches/01_vllm_pr40984.patch; \
+    python3 -c 'import vllm.v1.engine.core as c; assert hasattr(c.EngineCoreProc, "get_kv_cache_group_metadata"), "patch 01 did not land"'
+
+USER dynamo
